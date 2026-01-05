@@ -1,0 +1,25 @@
+[project]
+name = "crawl-agent"
+version = "1.0.0"
+description = "基于 LLM 的智能爬虫命令行工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "openai>=1.0.0",
+    "requests>=2.28.0",
+    "beautifulsoup4>=4.11.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+crawl-agent = "crawl_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["crawl_agent*"]
