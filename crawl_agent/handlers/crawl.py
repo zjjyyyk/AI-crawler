@@ -81,8 +81,11 @@ class CrawlHandler:
         self.visited_lock = threading.Lock()
         self.downloaded_resources: List[dict] = []
         self.download_lock = threading.Lock()
+        self.downloaded_files: Set[str] = set()  # 已下载文件的 URL
+        self.downloaded_files_lock = threading.Lock()
         self.errors: List[str] = []
         self.errors_lock = threading.Lock()
+        self.interrupted = False  # 中断标志
         
         # 爬取历史文件
         self.history_path = Path(__file__).parent.parent.parent / "data" / "crawl_history.json"
@@ -178,6 +181,10 @@ class CrawlHandler:
         current_level = [root_url]
         
         for depth in range(max_depth + 1):
+            if self.interrupted:
+                self.display.print_warning("检测到中断信号，停止爬取")
+                break
+            
             if not current_level:
                 break
             
@@ -201,22 +208,38 @@ class CrawlHandler:
             next_level_lock = threading.Lock()
             
             # 并行处理当前层
-            with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(urls_to_visit))) as executor:
-                futures = {
-                    executor.submit(
-                        self._process_page, url, save_path, criteria, depth
-                    ): url for url in urls_to_visit
-                }
-                
-                for future in as_completed(futures):
-                    url = futures[future]
-                    try:
-                        follow_links = future.result()
-                        if follow_links:
-                            with next_level_lock:
-                                next_level.extend(follow_links)
-                    except Exception as e:
-                        self.display.print_error(f"处理失败 {url}: {e}")
+            try:
+                with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(urls_to_visit))) as executor:
+                    futures = {
+                        executor.submit(
+                            self._process_page, url, save_path, criteria, depth
+                        ): url for url in urls_to_visit
+                    }
+                    
+                    for future in as_completed(futures):
+                        if self.interrupted:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+                        
+                        url = futures[future]
+                        try:
+                            follow_links = future.result(timeout=1)
+                            if follow_links:
+                                with next_level_lock:
+                                    next_level.extend(follow_links)
+                        except KeyboardInterrupt:
+                            self.interrupted = True
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise
+                        except Exception as e:
+                            if not self.interrupted:
+                                self.display.print_error(f"处理失败 {url}: {e}")
+            except KeyboardInterrupt:
+                self.interrupted = True
+                raise
+            
+            if self.interrupted:
+                break
             
             current_level = next_level
     
@@ -356,12 +379,34 @@ class CrawlHandler:
         
         for url in download_urls:
             try:
+                # 检查是否中断
+                if self.interrupted:
+                    break
+                
+                # 检查是否已下载过
+                with self.downloaded_files_lock:
+                    if url in self.downloaded_files:
+                        self.display.print_status(f"跳过已下载: {Path(urlparse(url).path).name}")
+                        continue
+                
                 # 获取文件名
                 filename = Path(urlparse(url).path).name
                 if not filename:
                     filename = "data"
                 
                 save_file = dataset_path / filename
+                
+                # 检查文件是否已存在
+                if save_file.exists() and save_file.stat().st_size > 0:
+                    file_size = save_file.stat().st_size
+                    downloaded_files.append({
+                        "name": filename,
+                        "size": file_size
+                    })
+                    with self.downloaded_files_lock:
+                        self.downloaded_files.add(url)
+                    self.display.print_status(f"文件已存在，跳过: {filename} ({file_size / 1024 / 1024:.2f} MB)")
+                    continue
                 
                 self.display.print_status(f"下载: {filename}")
                 
@@ -374,6 +419,8 @@ class CrawlHandler:
                         "name": filename,
                         "size": file_size
                     })
+                    with self.downloaded_files_lock:
+                        self.downloaded_files.add(url)
                     self.display.print_success(f"已下载: {filename} ({file_size / 1024 / 1024:.2f} MB)")
                 else:
                     with self.errors_lock:
@@ -415,7 +462,7 @@ class CrawlHandler:
                 self.downloaded_resources.append(dataset_info)
     
     def _download_with_progress(self, url: str, save_path: str) -> bool:
-        """带进度显示的下载"""
+        """下载文件（无实时进度，避免并行冲突）"""
         import requests
         
         try:
@@ -427,19 +474,12 @@ class CrawlHandler:
             # 确保目录存在
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             
-            downloaded = 0
+            # 下载文件
             with open(save_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # 简单的进度输出（每 1MB 输出一次）
-                        if total_size > 0 and downloaded % (1024 * 1024) < 8192:
-                            percent = downloaded / total_size * 100
-                            print(f"\r  进度: {percent:.1f}% ({downloaded / 1024 / 1024:.1f} MB)", end="", flush=True)
             
-            print()  # 换行
             return True
             
         except requests.exceptions.HTTPError as e:
@@ -453,23 +493,25 @@ class CrawlHandler:
             return False
     
     def _load_history(self):
-        """加载爬取历史"""
+        """加载下载历史（只加载已下载文件，不加载访问记录）"""
         try:
             if self.history_path.exists():
                 with open(self.history_path, 'r', encoding='utf-8') as f:
                     history = json.load(f)
-                    self.visited_urls = set(history.get("visited_urls", []))
-                    self.display.print_status(f"已加载 {len(self.visited_urls)} 条历史记录")
+                    # 只加载已下载文件，不加载 visited_urls
+                    self.downloaded_files = set(history.get("downloaded_files", []))
+                    if self.downloaded_files:
+                        self.display.print_status(f"已加载 {len(self.downloaded_files)} 个已下载文件记录")
         except Exception:
-            self.visited_urls = set()
+            self.downloaded_files = set()
     
     def _save_history(self):
-        """保存爬取历史"""
+        """保存下载历史（只保存已下载文件）"""
         try:
             self.history_path.parent.mkdir(parents=True, exist_ok=True)
             
             history = {
-                "visited_urls": list(self.visited_urls),
+                "downloaded_files": list(self.downloaded_files),
                 "last_updated": datetime.now().isoformat()
             }
             
