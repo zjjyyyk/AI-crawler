@@ -152,29 +152,45 @@ class IndexManager:
         self._save(data)
         return dataset["id"]
     
-    def update_path(self, old_path: str, new_path: str) -> bool:
+    def update_path(self, old_path: str, new_path: str) -> int:
         """
-        更新数据集路径
+        更新数据集路径（支持目录级别的批量更新）
         
         Args:
-            old_path: 旧路径
+            old_path: 旧路径（文件或目录）
             new_path: 新路径
             
         Returns:
-            是否成功更新
+            更新的记录数
         """
         data = self._load()
-        updated = False
+        updated_count = 0
+        
+        old_path = str(Path(old_path).resolve())
+        new_path = str(Path(new_path).resolve())
         
         for ds in data["datasets"]:
-            if ds.get("local_path") == old_path:
+            local_path = ds.get("local_path", "")
+            if not local_path:
+                continue
+            
+            local_path_resolved = str(Path(local_path).resolve())
+            
+            # 精确匹配
+            if local_path_resolved == old_path:
                 ds["local_path"] = new_path
-                updated = True
+                updated_count += 1
+            # 前缀匹配（目录移动场景）
+            elif local_path_resolved.startswith(old_path + os.sep):
+                # 替换前缀
+                relative_part = local_path_resolved[len(old_path):]
+                ds["local_path"] = new_path + relative_part
+                updated_count += 1
         
-        if updated:
+        if updated_count > 0:
             self._save(data)
         
-        return updated
+        return updated_count
     
     def delete(self, dataset_id: str) -> bool:
         """
