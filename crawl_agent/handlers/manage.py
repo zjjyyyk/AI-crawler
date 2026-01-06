@@ -1,57 +1,149 @@
 """
-管理处理器
+管理处理器 - 支持智能查询的数据集管理
 """
 
 import os
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 from ..core.llm import LLMClient
 from ..core.index import IndexManager
 from ..utils.display import Display
+from .query_engine import QueryEngine
 
 
 class ManageHandler:
-    """数据管理处理器"""
+    """数据管理处理器 - 支持完整的智能查询系统"""
     
-    # 解析意图的系统提示
-    PARSE_INTENT_SYSTEM = """你是一个文件管理助手。解析用户的文件管理指令。
+    # 解析意图的系统提示 - 支持完整的查询语法
+    PARSE_INTENT_SYSTEM = """你是一个智能文件管理助手。解析用户的文件管理和查询指令。
 
 【重要】数据集默认存储在 data/datasets/ 目录下。
 
 请返回 JSON 格式：
 {
-  "action": "move | delete | copy | list",
-  "source": "源路径",
-  "target": "目标路径（仅 move/copy 需要）"
+  "action": "move | delete | copy | list | stats | export",
+  "source": "源路径（move/delete/copy）",
+  "target": "目标路径（move/copy/export）",
+  "query": {  // list/stats 操作的查询规格
+    // === 过滤 ===
+    "keywords": ["关键词1", "关键词2"],  // 关键词过滤（AND关系）
+    "keywords_mode": "and",  // 或 "or"
+    "conditions": [  // 条件过滤
+      {"field": "字段名", "op": "操作符", "value": 值}
+    ],
+    
+    // === 多组查询（OR关系） ===
+    "or_groups": [
+      {"keywords": [...], "conditions": [...]},
+      {"keywords": [...], "conditions": [...]}
+    ],
+    
+    // === 排序 ===
+    "sort": "字段名",  // 或 [{"field": "...", "order": "asc/desc"}]
+    "sort_order": "asc",  // 或 "desc"
+    
+    // === 分页 ===
+    "limit": 10,  // 返回数量
+    "offset": 0,  // 跳过数量
+    
+    // === 聚合统计 ===
+    "aggregate": "count" 或 "sum:nodes" 或 "avg:edges" 或 "group:source"
+  }
 }
 
-动作说明：
+=== 动作说明 ===
+- list: 列出数据集（支持智能查询）
+- stats: 统计分析（聚合操作）
 - move: 移动文件/目录
-- delete: 删除文件/目录
 - copy: 复制文件/目录
-- list: 列出数据集
+- delete: 删除文件/目录
+- export: 导出查询结果到文件
 
-路径规则：
-- 【重要】根据提供的目录结构，推断用户指的是哪个具体目录
-  - 例如用户说"snap"，目录中有"snap.stanford.edu"，则应推断为 data/datasets/snap.stanford.edu
-  - 例如用户说"facebook数据"，目录中有"snap.stanford.edu/facebook/"，则应推断为 data/datasets/snap.stanford.edu/facebook
-- source 和 target 应该是完整路径（以 data/datasets/ 开头）
-- 如果用户想把目录内容移动到子目录（下沉操作），这是允许的
+=== 字段名（支持别名） ===
+- 节点数: nodes, n, node, vertices, v
+- 边数: edges, e, m, edge, links
+- 文件大小: size, filesize
+- 名称: name
+- 描述: description, desc
+- 来源: source_url, source, url
+- 路径: local_path, path
+- 时间: crawl_time, time, date
+- 标签: tags, tag
+- 格式: format, type
 
-示例：
-- "把 snap 数据移动到 backup" -> source: "data/datasets/snap.stanford.edu", target: "data/datasets/backup"
-- "删除 facebook 数据集" -> source: "data/datasets/snap.stanford.edu/facebook", action: "delete"
-- "列出所有数据集" -> action: "list"
-- "把 snap 里的数据移到 snap/social 下" -> source: "data/datasets/snap.stanford.edu", target: "data/datasets/snap.stanford.edu/social"
+=== 操作符 ===
+数值比较: >, >=, <, <=, ==, !=
+字符串: contains, not_contains, startswith, endswith, regex
+范围: between（值为 [min, max]）
+列表: in, not_in（值为数组）
+空值: is_null, is_not_null
 
-list 操作不需要 source 和 target"""
+=== 排序 ===
+- 单字段: "sort": "nodes", "sort_order": "desc"
+- 多字段: "sort": [{"field": "source", "order": "asc"}, {"field": "nodes", "order": "desc"}]
+- 简写: "sort": ["-nodes", "name"]（-表示降序）
+
+=== 聚合统计 ===
+- count: 计数
+- sum:字段: 求和（如 sum:nodes）
+- avg:字段: 平均值
+- min:字段, max:字段: 最小/最大值
+- group:字段: 分组统计
+- distinct:字段: 去重计数
+
+=== 关键词翻译（中文→英文） ===
+路网/道路网络 -> road
+社交网络 -> social
+引用网络 -> citation
+通信网络 -> communication
+生物网络 -> bio
+
+=== 示例 ===
+
+【基本列表】
+"列出所有数据集" -> {"action": "list"}
+"列出 konect 数据集" -> {"action": "list", "query": {"keywords": ["konect"]}}
+
+【条件过滤】
+"列出节点数大于1000的数据集" -> {"action": "list", "query": {"conditions": [{"field": "nodes", "op": ">", "value": 1000}]}}
+"找出 100到10000 个节点的数据" -> {"action": "list", "query": {"conditions": [{"field": "nodes", "op": "between", "value": [100, 10000]}]}}
+
+【多关键词】
+"snap 的路网数据" -> {"action": "list", "query": {"keywords": ["snap", "road"]}}
+
+【复合条件】
+"snap 路网里 n>1000 的" -> {"action": "list", "query": {"keywords": ["snap", "road"], "conditions": [{"field": "nodes", "op": ">", "value": 1000}]}}
+
+【多组查询（OR）】
+"snap社交网络n>1000 和 konect路网m<100000" -> {"action": "list", "query": {"or_groups": [
+  {"keywords": ["snap", "social"], "conditions": [{"field": "nodes", "op": ">", "value": 1000}]},
+  {"keywords": ["konect", "road"], "conditions": [{"field": "edges", "op": "<", "value": 100000}]}
+]}}
+
+【排序】
+"按节点数从大到小排列" -> {"action": "list", "query": {"sort": "nodes", "sort_order": "desc"}}
+"前10个最大的数据集" -> {"action": "list", "query": {"sort": "nodes", "sort_order": "desc", "limit": 10}}
+
+【统计】
+"统计有多少数据集" -> {"action": "stats", "query": {"aggregate": "count"}}
+"总节点数是多少" -> {"action": "stats", "query": {"aggregate": "sum:nodes"}}
+"按来源分组统计" -> {"action": "stats", "query": {"aggregate": "group:source"}}
+"snap数据的平均节点数" -> {"action": "stats", "query": {"keywords": ["snap"], "aggregate": "avg:nodes"}}
+
+【导出】
+"把 snap 数据集导出到 result.json" -> {"action": "export", "query": {"keywords": ["snap"]}, "target": "result.json"}
+
+【文件操作】
+"把 snap 移到 backup" -> {"action": "move", "source": "data/datasets/snap.stanford.edu", "target": "data/datasets/backup"}
+"删除 facebook 数据集" -> {"action": "delete", "source": "data/datasets/snap.stanford.edu/facebook"}"""
 
     def __init__(self):
         self.llm = LLMClient()
         self.index = IndexManager()
         self.display = Display()
+        self.query_engine = QueryEngine()
     
     def handle(self, prompt: str) -> dict:
         """
@@ -70,16 +162,39 @@ list 操作不需要 source 和 target"""
         action = intent.get("action", "").lower()
         source = intent.get("source", "")
         target = intent.get("target", "")
+        query_spec = intent.get("query", {})
+        
+        # 兼容旧格式：conditions 和 queries
+        if not query_spec:
+            conditions = intent.get("conditions", [])
+            queries = intent.get("queries", [])
+            source_kw = intent.get("source", "")
+            
+            if queries:
+                query_spec = {"or_groups": queries}
+            elif (isinstance(source_kw, (str, list)) and source_kw) or conditions:
+                if isinstance(source_kw, str) and source_kw and action == "list":
+                    query_spec["keywords"] = [source_kw]
+                elif isinstance(source_kw, list):
+                    query_spec["keywords"] = source_kw
+                if conditions:
+                    query_spec["conditions"] = conditions
         
         self.display.print_status(f"动作: {action}")
-        if source:
+        if source and action in ["move", "copy", "delete"]:
             self.display.print_status(f"源: {source}")
         if target:
             self.display.print_status(f"目标: {target}")
+        if query_spec:
+            self._print_query_spec(query_spec)
         
         # 2. 执行对应操作
         if action == "list":
-            return self._handle_list()
+            return self._handle_list(query_spec)
+        elif action == "stats":
+            return self._handle_stats(query_spec)
+        elif action == "export":
+            return self._handle_export(query_spec, target)
         elif action == "move":
             return self._handle_move(source, target)
         elif action == "copy":
@@ -89,6 +204,44 @@ list 操作不需要 source 和 target"""
         else:
             self.display.print_error(f"未知操作: {action}")
             return {"success": False, "error": f"未知操作: {action}"}
+    
+    def _print_query_spec(self, spec: dict):
+        """打印查询规格摘要"""
+        parts = []
+        if spec.get("keywords"):
+            parts.append(f"关键词: {spec['keywords']}")
+        if spec.get("conditions"):
+            # 格式化条件为易读形式
+            cond_strs = []
+            for c in spec['conditions']:
+                field = c.get('field', '?')
+                op = c.get('op', '?')
+                value = c.get('value', '?')
+                cond_strs.append(f"{field}{op}{value}")
+            parts.append(f"条件: {', '.join(cond_strs)}")
+        if spec.get("or_groups"):
+            # 格式化多组查询
+            group_strs = []
+            for i, g in enumerate(spec['or_groups'], 1):
+                kws = g.get('keywords', [])
+                conds = g.get('conditions', [])
+                g_parts = []
+                if kws:
+                    g_parts.append(f"关键词={kws}")
+                if conds:
+                    c_strs = [f"{c.get('field')}{c.get('op')}{c.get('value')}" for c in conds]
+                    g_parts.append(f"条件={c_strs}")
+                group_strs.append(f"({' '.join(g_parts)})")
+            parts.append(f"多组查询: {' OR '.join(group_strs)}")
+        if spec.get("sort"):
+            order = spec.get('sort_order', 'asc')
+            parts.append(f"排序: {spec['sort']} {order}")
+        if spec.get("limit"):
+            parts.append(f"限制: {spec['limit']}")
+        if spec.get("aggregate"):
+            parts.append(f"聚合: {spec['aggregate']}")
+        if parts:
+            self.display.print_status(f"查询: {', '.join(parts)}")
     
     def _parse_intent(self, prompt: str) -> dict:
         """解析用户意图"""
@@ -237,16 +390,186 @@ list 操作不需要 source 和 target"""
         
         return None
     
-    def _handle_list(self) -> dict:
-        """列出所有数据集"""
-        datasets = self.index.get_all()
+    def _handle_list(self, query_spec: dict = None) -> dict:
+        """
+        列出数据集（使用智能查询引擎）
+        
+        Args:
+            query_spec: 查询规格字典
+            
+        Returns:
+            查询结果
+        """
+        all_datasets = self.index.get_all()
+        query_spec = query_spec or {}
+        
+        # 使用查询引擎执行查询
+        result = self.query_engine.query(all_datasets, query_spec)
+        datasets = result.get("data", [])
+        
+        if not datasets:
+            if query_spec:
+                self.display.print_warning("未找到匹配条件的数据集")
+            else:
+                self.display.print_warning("索引中没有数据集")
+        
         self.display.print_datasets(datasets)
+        
+        # 如果有聚合结果，也显示
+        if result.get("aggregation"):
+            self._print_aggregation(result["aggregation"])
         
         return {
             "success": True,
             "action": "list",
-            "count": len(datasets)
+            "query": query_spec,
+            "count": result["count"],
+            "total": result["total"]
         }
+    
+    def _handle_stats(self, query_spec: dict = None) -> dict:
+        """
+        统计分析
+        
+        Args:
+            query_spec: 查询规格（必须包含 aggregate）
+            
+        Returns:
+            统计结果
+        """
+        all_datasets = self.index.get_all()
+        query_spec = query_spec or {}
+        
+        # 确保有聚合操作
+        if not query_spec.get("aggregate"):
+            query_spec["aggregate"] = "count"
+        
+        # 使用查询引擎执行查询
+        result = self.query_engine.query(all_datasets, query_spec)
+        
+        # 显示统计结果
+        self._print_aggregation(result.get("aggregation", {}))
+        
+        # 如果筛选后有数据，也显示数量
+        filtered_count = result.get("count", 0)
+        total = result.get("total", 0)
+        if filtered_count < total:
+            self.display.print_status(f"（筛选后 {filtered_count} / 总计 {total} 个数据集）")
+        
+        return {
+            "success": True,
+            "action": "stats",
+            "query": query_spec,
+            "aggregation": result.get("aggregation"),
+            "count": filtered_count,
+            "total": total
+        }
+    
+    def _handle_export(self, query_spec: dict, target: str) -> dict:
+        """
+        导出查询结果到文件
+        
+        Args:
+            query_spec: 查询规格
+            target: 目标文件路径
+            
+        Returns:
+            导出结果
+        """
+        import json
+        
+        all_datasets = self.index.get_all()
+        query_spec = query_spec or {}
+        
+        # 使用查询引擎执行查询
+        result = self.query_engine.query(all_datasets, query_spec)
+        datasets = result.get("data", [])
+        
+        if not datasets:
+            self.display.print_warning("没有数据可导出")
+            return {"success": False, "error": "没有数据可导出"}
+        
+        # 解析目标路径
+        target_path = Path(target)
+        if not target_path.is_absolute():
+            base_dir = Path(__file__).parent.parent.parent
+            target_path = base_dir / target
+        target_path = target_path.resolve()
+        
+        # 确保目录存在
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 根据扩展名决定格式
+        ext = target_path.suffix.lower()
+        
+        try:
+            if ext == ".json":
+                with open(target_path, "w", encoding="utf-8") as f:
+                    json.dump(datasets, f, ensure_ascii=False, indent=2)
+            elif ext == ".csv":
+                self._export_csv(datasets, target_path)
+            else:
+                # 默认 JSON
+                with open(target_path, "w", encoding="utf-8") as f:
+                    json.dump(datasets, f, ensure_ascii=False, indent=2)
+            
+            self.display.print_success(f"已导出 {len(datasets)} 条记录到: {target_path}")
+            
+            return {
+                "success": True,
+                "action": "export",
+                "target": str(target_path),
+                "count": len(datasets)
+            }
+            
+        except Exception as e:
+            self.display.print_error(f"导出失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def _export_csv(self, datasets: list, path: Path):
+        """导出为 CSV 格式"""
+        import csv
+        
+        if not datasets:
+            return
+        
+        # 收集所有字段
+        fields = set()
+        for ds in datasets:
+            fields.update(ds.keys())
+            if "properties" in ds:
+                fields.update(f"prop_{k}" for k in ds["properties"].keys())
+        fields = sorted(fields)
+        
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            
+            for ds in datasets:
+                row = dict(ds)
+                # 展开 properties
+                if "properties" in ds:
+                    for k, v in ds["properties"].items():
+                        row[f"prop_{k}"] = v
+                writer.writerow(row)
+    
+    def _print_aggregation(self, agg: dict):
+        """打印聚合结果"""
+        if not agg:
+            return
+        
+        print("\n📊 统计结果:")
+        for key, value in agg.items():
+            if isinstance(value, dict):
+                # 分组统计
+                print(f"  {key}:")
+                for k, v in sorted(value.items(), key=lambda x: -x[1] if isinstance(x[1], (int, float)) else x[0]):
+                    print(f"    {k}: {v}")
+            elif isinstance(value, float):
+                print(f"  {key}: {value:.2f}")
+            else:
+                print(f"  {key}: {value}")
+        print()
     
     def _handle_move(self, source: str, target: str) -> dict:
         """移动数据"""
